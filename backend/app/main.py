@@ -13,17 +13,17 @@ before any validation runs.
 """
 
 from __future__ import annotations
-
+from pathlib import Path
 import time
 from contextlib import asynccontextmanager
-
+import traceback
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
-
+from app.services import rag_service
 from app.api.routes import (
     auth_router,
     chat_router,
@@ -45,7 +45,12 @@ async def lifespan(app: FastAPI):
     # get_settings() is called HERE — after uvicorn has fully started and
     # all environment variables injected by Docker are available.
     from app.core.settings import get_settings          # local import is intentional
-    from app.services.rag_service import warmup
+    from app.services.rag_service import (
+            warmup,
+            get_knowledge_stats,
+            delete_source,
+            ingest_document
+        )
     from app.services.user_service import find_by_username
 
     cfg = get_settings()                                # validates secrets; exits on error
@@ -60,6 +65,40 @@ async def lifespan(app: FastAPI):
     # First-boot admin creation + vector index warm-up
     await find_by_username(cfg.admin_username)
     await warmup()
+
+# ── Automatic Data Ingestion ──────────────────────────────────────────────
+    data_file = Path("/app/app/data.md")  # Adjust this path if data.md is in a subdirectory (e.g., Path("app/data.md"))
+    log.info("data_file: ", data_file)
+    if data_file.exists():
+        try:
+
+            source_name = data_file.name
+
+            # 1. Remove old chunks for this source if they exist
+            log.info("startup_clearing_existing_data", source=source_name)
+            chunks_removed = await delete_source(source=source_name)
+
+            if chunks_removed > 0:
+                log.info("startup_old_data_purged", source=source_name, count=chunks_removed)
+
+
+            # 2. Ingest the fresh file content
+            log.info("startup_ingestion_started", source=source_name)
+            content = data_file.read_text(encoding="utf-8")
+
+            chunks_created = await ingest_document(
+                content=content,
+                source=source_name,
+                metadata={"category": "system_bootstrap"}
+            )
+            log.info("startup_ingestion_success", source=source_name, chunks=chunks_created)
+
+        except Exception as exc:
+            traceback.print_stack()
+            log.error("startup_reingestion_failed", error=str(exc))
+    else:
+        log.warning("startup_ingestion_skipped", reason="file_not_found", path=str(data_file))
+    # ─────────────────────────────────────────────────────────────────────────
 
     log.info("ready")
     yield

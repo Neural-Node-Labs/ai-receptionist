@@ -234,6 +234,43 @@ async def retrieve_context(query: str) -> tuple[list[KnowledgeChunk], str, int]:
     return selected, context_text, MAX_CONTEXT_TOKENS - budget
 
 
+async def delete_source(source: str) -> int:
+    """
+    Remove all chunks belonging to *source* from the in-memory store and
+    rebuild the hnswlib index without them.
+
+    Returns the number of chunks removed.
+    """
+    global _index, _chunks, _next_id
+
+    async with _store_lock:
+        # Identify chunk IDs to remove
+        to_remove = {k for k, v in _chunks.items() if v["source"] == source}
+        if not to_remove:
+            return 0
+
+        for k in to_remove:
+            del _chunks[k]
+
+        # Rebuild index from scratch with surviving chunks
+        import hnswlib  # type: ignore
+        new_idx = hnswlib.Index(space="cosine", dim=EMBEDDING_DIM)
+        new_idx.init_index(max_elements=50_000, ef_construction=200, M=16)
+
+        if _chunks:
+            surviving_ids = list(_chunks.keys())
+            texts = [_chunks[i]["content"] for i in surviving_ids]
+            vecs  = await _embed(texts)
+            new_idx.add_items(vecs, surviving_ids)
+
+        new_idx.set_ef(50)
+        _index = new_idx
+
+    await _persist_index()
+    log.info("source_deleted", source=source, chunks_removed=len(to_remove))
+    return len(to_remove)
+
+
 async def get_knowledge_stats() -> dict:
     sources = list({c["source"] for c in _chunks.values()})
     return {
